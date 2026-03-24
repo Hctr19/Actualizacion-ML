@@ -13,7 +13,7 @@ SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
 SHEET_NAME = 'ML'
 CONFIG_SHEET = 'Config_ML'
 HISTORY_SHEET = 'Historial'
-HORAS_ATRAS = 6 
+HORAS_ATRAS = 2 
 
 def get_new_token(config_ws):
     try:
