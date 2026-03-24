@@ -1,0 +1,18 @@
+name: Sync MercadoLibre
+on:
+  schedule:
+    - cron: '0 */2 * * *' # Cada 2 horas
+  workflow_dispatch: # Botón manual
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: python sincronizador_ml.py
