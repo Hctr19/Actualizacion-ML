@@ -47,8 +47,14 @@ def get_data(i_id, token):
 def enviar_alerta_telegram(mensaje):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje, 'parse_mode': 'Markdown'}
-    try: requests.post(url, data=payload, timeout=10)
-    except: print("Error en Telegram")
+    try:
+        res = requests.post(url, data=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"❌ Error de Telegram: {res.text}") # Esto te dirá por qué falló
+        else:
+            print("✅ Mensaje enviado a Telegram correctamente")
+    except Exception as e:
+        print(f"❌ Error de conexión con Telegram: {e}")
 
 def actualizar_historial_limpio(h_ws, nuevos_logs):
     """Limpia registros antiguos basados en HORAS_ATRAS y ordena."""
