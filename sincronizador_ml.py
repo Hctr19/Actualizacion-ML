@@ -17,7 +17,7 @@ HISTORY_SHEET = 'Historial'
 HORAS_ATRAS = 48 
 
 # --- CONFIGURACIÓN DISCORD ---
-DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1487226041717227630/H_mZCqh4jcDuMP6TZBkkTxXkGGS8pSRXmbvj4xvIAu0R4sld3WooinrYjyo9z5LGK5oo'
+DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL')
 
 def get_new_token(config_ws):
     try:
