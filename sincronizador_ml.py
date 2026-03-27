@@ -125,9 +125,18 @@ def run_update():
             sheet_promo = float(row['Precio Promo']) if row['Precio Promo'] != '' else 0.0
             sheet_stock = int(row['Stock (Solo Full)']) if row['Stock (Solo Full)'] != '' else 0
 
-            # --- ALERTA TELEGRAM (Solo si pasa de >0 a 0) ---
-            if es_full and nuevo_stock == 0 and sheet_stock > 0:
-                enviar_alerta_telegram(f"⚠️ *STOCK 0 EN FULL*\n📦 {item.get('title')}\nID: `{it_id}`")
+           # --- NUEVA LÓGICA DE ALERTA: NOTIFICAR CUALQUIER PAUSA EN FULL ---
+            # Si el producto es de Full y antes estaba Activo, pero ahora está Pausado
+            if es_full and sheet_estatus == "Activa" and nuevo_estatus == "Pausada":
+                razon_pausa = "Sin Stock" if nuevo_stock == 0 else "Motivo Externo (Manual/ML)"
+                
+                mensaje = (f"🚫 *PUBLICACIÓN PAUSADA EN FULL*\n\n"
+                           f"📦 *Producto:* {item.get('title')[:60]}...\n"
+                           f"🆔 *ID:* `{it_id}`\n"
+                           f"❓ *Posible causa:* {razon_pausa}\n"
+                           f"🔗 [Ver en ML]({item.get('permalink')})")
+                
+                enviar_alerta_telegram(mensaje)
 
             # --- DETECCIÓN DE CAMBIOS ---
             if (sheet_estatus != nuevo_estatus) or (abs(sheet_promo - nuevo_p_promo) > 0.01) or (sheet_stock != nuevo_stock):
