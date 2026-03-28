@@ -140,14 +140,28 @@ def run_update():
             # Normalizamos el estatus del Excel (quitar espacios y normalizar)
             sheet_estatus = str(row['Estatus']).strip().capitalize() 
 
-            # --- DETECTAR PAUSA EN FULL ---
-            if es_full and sheet_estatus == "Activa" and nuevo_estatus == "Pausada":
-                razon = "Sin Stock" if stock_real == 0 else f"Motivo ML ({api_status})"
-                # Guardamos en la lista en lugar de enviar el mensaje ya
-                # Usamos formato Bloque de Código de Discord (```yaml ...)
-                titulo_caja = item.get('title', 'Producto')[:30]
-                alertas_para_discord.append(f"• {it_id} | {titulo_caja:<30} | {razon}")
+            # --- OBTENER SUB-STATUS Y ESTADO NUEVO ---
+            sub_status_list = item.get('sub_status', [])
+            sub_status_str = ", ".join(sub_status_list) if sub_status_list else "N/A"
+            
+            # --- DETECTAR PAUSAS Y MODERACIONES (UNDER REVIEW) ---
+            # Si antes estaba Activa y ahora hay algún cambio de estado o sub-estado relevante
+            if sheet_estatus == "Activa":
+                es_revision = "under_review" in sub_status_list or "waiting_for_patch" in sub_status_list
+                
+                if nuevo_estatus == "Pausada" or es_revision:
+                    # Definimos la razón de la alerta
+                    if es_revision:
+                        razon = f"⚠️ BAJO REVISIÓN ({sub_status_str})"
+                    elif es_full and stock_real == 0:
+                        razon = "Pausada (Sin Stock en Full)"
+                    else:
+                        razon = f"Pausada (Sub: {sub_status_str})"
 
+                    titulo_caja = item.get('title', 'Producto')[:30]
+                    # Agregamos a la lista de alertas para Discord
+                    alertas_para_discord.append(f"• {it_id} | {titulo_caja:<30} | {razon}")
+                    
             # --- DETECCIÓN DE CAMBIOS PARA EL EXCEL ---
             nuevo_p_promo = float(data.get('promo_price') or 0.0)
             nuevo_stock = int(stock_real) if es_full else 0
