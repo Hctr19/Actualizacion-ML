@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import pytz
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-SPREADSHEET_ID = os.environ['SPREADSHEET_ID'] # O cámbialo por tu ID "12345..."
+SPREADSHEET_ID = os.environ['SPREADSHEET_ID'] 
 SHEET_NAME = 'ML'
 CONFIG_SHEET = 'Config_ML'
 HISTORY_SHEET = 'Historial'
@@ -20,6 +20,7 @@ HORAS_ATRAS = 48
 DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL')
 
 def get_new_token(config_ws):
+    """Refresca el token de acceso de Mercado Libre."""
     try:
         c_id = str(config_ws.acell('A2').value).replace(',', '').replace(' ', '').strip()
         c_secret = str(config_ws.acell('B2').value).strip()
@@ -34,6 +35,7 @@ def get_new_token(config_ws):
     except: return None
 
 def get_data(i_id, token):
+    """Obtiene detalles del item y precio promocional."""
     headers = {'Authorization': f'Bearer {token}'}
     try:
         it = requests.get(f"https://api.mercadolibre.com/items/{i_id}", headers=headers, timeout=15).json()
@@ -42,21 +44,18 @@ def get_data(i_id, token):
         return {'body': it, 'promo_price': p_promo}
     except: return None
 
-# --- NUEVA FUNCIÓN DE DISCORD ---
 def enviar_alerta_discord(mensaje):
-    """Lanza un mensaje a un webhook de Discord."""
-    # Discord usa JSON con la clave "content"
+    """Envía un mensaje al webhook de Discord configurado."""
     payload = {"content": mensaje}
     try:
-        # Los webhooks no necesitan Authorization header, son públicos por la URL
         res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        if res.status_code != 204: # Discord responde 204 (No Content) si sale bien
+        if res.status_code != 204:
             print(f"❌ Error Discord: {res.status_code} - {res.text}")
     except:
         print("❌ Fallo de conexión con Discord")
 
 def actualizar_historial_limpio(h_ws, nuevos_logs):
-    """Filtra los últimos 2 días, añade nuevos, ordena y actualiza la hoja."""
+    """Filtra y actualiza la hoja de historial manteniendo el orden cronológico."""
     datos_actuales = h_ws.get_all_values()
     encabezado = ["Item ID", "Cual fue el cambio", "Ultima Modificacion ML"]
     registros_validos = []
@@ -77,9 +76,7 @@ def actualizar_historial_limpio(h_ws, nuevos_logs):
         todos.sort(key=lambda x: datetime.strptime(x[2], formato_fecha), reverse=True)
     except: pass
 
-    # Evitamos que el historial crezca más de 5000 filas para Google Sheets
     todos_limitados = todos[:5000]
-
     h_ws.clear()
     h_ws.update([encabezado] + todos_limitados, 'A1')
 
@@ -109,20 +106,21 @@ def run_update():
             if res: item_details[f_to_id[f]] = res
 
     log_reporte = []
-    
-    # --- BOLSA DE ALERTAS DISCORD ---
     alertas_para_discord = [] 
-    
     limite_historial = datetime.now(pytz.utc) - timedelta(hours=HORAS_ATRAS)
     hubo_cambios = False
 
-    # --- PROCESAR CAMBIOS (10k items) ---
+    # --- PROCESAR CAMBIOS ---
     for i, row in df.iterrows():
         it_id = str(row['Item ID']).strip()
         if it_id in item_details:
             data = item_details[it_id]
             item = data['body']
             v_id = str(row['Variant ID']).strip()
+
+            # --- NUEVO: OBTENER LOGÍSTICA ---
+            logistica_real = item.get('shipping', {}).get('logistic_type', 'not_specified')
+            sheet_logistica = str(row.get('Logistica', '')).strip()
 
             # Stock real
             if v_id and v_id not in ['0', '', 'None']:
@@ -131,26 +129,20 @@ def run_update():
             else:
                 stock_real = item.get('available_quantity', 0)
 
-            es_full = item.get('shipping', {}).get('logistic_type') == 'fulfillment'
+            es_full = logistica_real == 'fulfillment'
             
-            # --- TRADUCTOR INTELIGENTE ---
-            api_status = item.get('status') # 'active', 'paused', etc.
+            # --- TRADUCTOR ESTATUS ---
+            api_status = item.get('status') 
             nuevo_estatus = "Activa" if api_status == 'active' and stock_real > 0 else "Pausada"
-            
-            # Normalizamos el estatus del Excel (quitar espacios y normalizar)
             sheet_estatus = str(row['Estatus']).strip().capitalize() 
 
-            # --- OBTENER SUB-STATUS Y ESTADO NUEVO ---
+            # --- SUB-STATUS Y MODERACIONES ---
             sub_status_list = item.get('sub_status', [])
             sub_status_str = ", ".join(sub_status_list) if sub_status_list else "N/A"
             
-            # --- DETECTAR PAUSAS Y MODERACIONES (UNDER REVIEW) ---
-            # Si antes estaba Activa y ahora hay algún cambio de estado o sub-estado relevante
             if sheet_estatus == "Activa":
                 es_revision = "under_review" in sub_status_list or "waiting_for_patch" in sub_status_list
-                
                 if nuevo_estatus == "Pausada" or es_revision:
-                    # Definimos la razón de la alerta
                     if es_revision:
                         razon = f"⚠️ BAJO REVISIÓN ({sub_status_str})"
                     elif es_full and stock_real == 0:
@@ -159,10 +151,9 @@ def run_update():
                         razon = f"Pausada (Sub: {sub_status_str})"
 
                     titulo_caja = item.get('title', 'Producto')[:30]
-                    # Agregamos a la lista de alertas para Discord
                     alertas_para_discord.append(f"• {it_id} | {titulo_caja:<30} | {razon}")
                     
-            # --- DETECCIÓN DE CAMBIOS PARA EL EXCEL ---
+            # --- DETECCIÓN DE CAMBIOS ---
             nuevo_p_promo = float(data.get('promo_price') or 0.0)
             nuevo_stock = int(stock_real) if es_full else 0
             nuevo_p_base = float(item.get('original_price') or item.get('price') or 0.0)
@@ -170,11 +161,20 @@ def run_update():
             sheet_promo = float(row['Precio Promo']) if row['Precio Promo'] != '' else 0.0
             sheet_stock = int(row['Stock (Solo Full)']) if row['Stock (Solo Full)'] != '' else 0
 
-            if (sheet_estatus != nuevo_estatus) or (abs(sheet_promo - nuevo_p_promo) > 0.01) or (sheet_stock != nuevo_stock):
+            # Verificamos si cambió algo, incluyendo la logística
+            cambio_en_fila = (
+                (sheet_estatus != nuevo_estatus) or 
+                (abs(sheet_promo - nuevo_p_promo) > 0.01) or 
+                (sheet_stock != nuevo_stock) or
+                (sheet_logistica != logistica_real)
+            )
+
+            if cambio_en_fila:
                 df.at[i, 'Precio Base'] = nuevo_p_base
                 df.at[i, 'Precio Promo'] = nuevo_p_promo
                 df.at[i, 'Stock (Solo Full)'] = nuevo_stock
                 df.at[i, 'Estatus'] = nuevo_estatus
+                df.at[i, 'Logistica'] = logistica_real # Actualiza la columna H
                 hubo_cambios = True
 
                 last_up_str = item.get('last_updated', '').replace('Z', '+00:00')
@@ -184,19 +184,16 @@ def run_update():
                         cambios = []
                         if sheet_estatus != nuevo_estatus: cambios.append(f"Stat: {sheet_estatus}->{nuevo_estatus}")
                         if sheet_stock != nuevo_stock: cambios.append(f"Stock: {sheet_stock}->{nuevo_stock}")
+                        if sheet_logistica != logistica_real: cambios.append(f"Log: {sheet_logistica}->{logistica_real}")
                         if abs(sheet_promo - nuevo_p_promo) > 0.01: cambios.append(f"P: {sheet_promo}->{nuevo_p_promo}")
                         
                         log_reporte.append([it_id, " | ".join(cambios), fecha_mod_ml.strftime("%d/%m/%Y %H:%M")])
                 except: continue
 
-    # --- ENVIAR RESUMEN A DISCORD (Fuera del bucle for) ---
+    # --- ENVIAR RESUMEN A DISCORD ---
     if alertas_para_discord:
-        # Discord permite hasta 2000 caracteres por mensaje.
-        # Agrupamos las alertas de 15 en 15 para no saturar.
         chunks_alertas = [alertas_para_discord[x:x+15] for x in range(0, len(alertas_para_discord), 15)]
-        
         for grupo in chunks_alertas:
-            # Creamos un bloque de código tipo YAML para que se vea ordenado
             texto_alertas = "\n".join(grupo)
             mensaje_final = (
                 f"⚠️ **RESUMEN DE PAUSAS EN FULL ({datetime.now().strftime('%H:%M')})** ⚠️\n"
@@ -208,10 +205,8 @@ def run_update():
 
     # --- GUARDAR RESULTADOS EN GOOGLE SHEETS ---
     if hubo_cambios:
-        # Actualizar hoja 'ML' completa
         worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist(), 'A1')
         
-        # Actualizar 'Historial' con limpieza y orden
         if log_reporte:
             h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
             if h_ws is None:
