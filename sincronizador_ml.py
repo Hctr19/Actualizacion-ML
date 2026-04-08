@@ -35,30 +35,28 @@ def get_new_token(config_ws):
     except: return None
 
 def get_data(i_id, token):
-    """Obtiene detalles del item, precio promocional y comisión por venta."""
+    """Obtiene detalles del item, precio promocional y comisión basada en el precio real de venta."""
     headers = {'Authorization': f'Bearer {token}'}
     try:
         # Detalle del ítem
         it_res = requests.get(f"https://api.mercadolibre.com/items/{i_id}", headers=headers, timeout=15)
         it = it_res.json()
         
-        # Precio promocional
+        # Precio promocional (el que ve el cliente)
         sp = requests.get(f"https://api.mercadolibre.com/items/{i_id}/sale_price", headers=headers, timeout=15).json()
         p_promo = sp.get('amount') or it.get('price') or 0
         
-        # --- CONSULTA DE COMISIÓN ---
-        price = it.get('price', 0)
+        # --- CONSULTA DE COMISIÓN BASADA EN PRECIO DE PROMO ---
         cat_id = it.get('category_id')
         l_type = it.get('listing_type_id')
-        site_id = it.get('site_id', 'MLM') # Por defecto México si no se detecta
+        site_id = it.get('site_id', 'MLM')
         comision = 0
         
-        if price and cat_id and l_type:
-            # Consultar el calculador de cargos de ML
-            comm_url = f"https://api.mercadolibre.com/sites/{site_id}/listing_prices?price={price}&category_id={cat_id}&listing_type_id={l_type}"
+        # Usamos p_promo en lugar de it.get('price') para que el cálculo sea real
+        if p_promo and cat_id and l_type:
+            comm_url = f"https://api.mercadolibre.com/sites/{site_id}/listing_prices?price={p_promo}&category_id={cat_id}&listing_type_id={l_type}"
             comm_res = requests.get(comm_url, headers=headers, timeout=10).json()
             
-            # Extraer sale_fee_amount (comisión fija + variable)
             if isinstance(comm_res, list) and len(comm_res) > 0:
                 comision = comm_res[0].get('sale_fee_amount', 0)
             elif isinstance(comm_res, dict):
@@ -115,12 +113,12 @@ def run_update():
         print("Error: No se pudo refrescar el token de ML")
         return
 
-    # --- OBTENER DATOS DE LA HOJA 'PUBLICACIONES' ---
+    # --- OBTENER DATOS DE LA HOJA ---
     worksheet = sh.worksheet(SHEET_NAME)
     df = pd.DataFrame(worksheet.get_all_records()).fillna('')
     unique_ids = df['Item ID'].unique().tolist()
 
-    # --- DESCARGA CONCURRENTE (25 workers) ---
+    # --- DESCARGA CONCURRENTE ---
     item_details = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
         f_to_id = {executor.submit(get_data, i_id, access_token): i_id for i_id in unique_ids}
@@ -141,7 +139,6 @@ def run_update():
             item = data['body']
             v_id = str(row['Variant ID']).strip()
 
-            # Logística y Comisión
             logistica_real = item.get('shipping', {}).get('logistic_type', 'not_specified')
             sheet_logistica = str(row.get('Logistica', '')).strip()
             nueva_comision = float(data.get('comision', 0.0))
@@ -154,30 +151,22 @@ def run_update():
                 stock_real = item.get('available_quantity', 0)
 
             es_full = logistica_real == 'fulfillment'
-            
-            # Estatus
             api_status = item.get('status') 
             nuevo_estatus = "Activa" if api_status == 'active' and stock_real > 0 else "Pausada"
             sheet_estatus = str(row['Estatus']).strip().capitalize() 
 
-            # Sub-status y Moderaciones
+            # Sub-status
             sub_status_list = item.get('sub_status', [])
             sub_status_str = ", ".join(sub_status_list) if sub_status_list else "N/A"
             
             if sheet_estatus == "Activa":
                 es_revision = "under_review" in sub_status_list or "waiting_for_patch" in sub_status_list
                 if nuevo_estatus == "Pausada" or es_revision:
-                    if es_revision:
-                        razon = f"⚠️ BAJO REVISIÓN ({sub_status_str})"
-                    elif es_full and stock_real == 0:
-                        razon = "Pausada (Sin Stock en Full)"
-                    else:
-                        razon = f"Pausada (Sub: {sub_status_str})"
-
+                    razon = f"⚠️ REVISIÓN ({sub_status_str})" if es_revision else f"Pausada ({sub_status_str})"
                     titulo_caja = item.get('title', 'Producto')[:30]
                     alertas_para_discord.append(f"• {it_id} | {titulo_caja:<30} | {razon}")
                     
-            # Detección de cambios numéricos
+            # Detección de cambios
             nuevo_p_promo = float(data.get('promo_price') or 0.0)
             nuevo_stock = int(stock_real) if es_full else 0
             nuevo_p_base = float(item.get('original_price') or item.get('price') or 0.0)
@@ -186,7 +175,6 @@ def run_update():
             sheet_stock = int(row['Stock (Solo Full)']) if row['Stock (Solo Full)'] != '' else 0
             sheet_comision = float(row.get('Comision', 0.0)) if row.get('Comision', '') != '' else 0.0
 
-            # Verificación integral de cambios
             cambio_en_fila = (
                 (sheet_estatus != nuevo_estatus) or 
                 (abs(sheet_promo - nuevo_p_promo) > 0.01) or 
@@ -211,38 +199,23 @@ def run_update():
                         cambios = []
                         if sheet_estatus != nuevo_estatus: cambios.append(f"Stat: {sheet_estatus}->{nuevo_estatus}")
                         if sheet_stock != nuevo_stock: cambios.append(f"Stock: {sheet_stock}->{nuevo_stock}")
-                        if sheet_logistica != logistica_real: cambios.append(f"Log: {sheet_logistica}->{logistica_real}")
                         if abs(sheet_promo - nuevo_p_promo) > 0.01: cambios.append(f"P: {sheet_promo}->{nuevo_p_promo}")
                         if abs(sheet_comision - nueva_comision) > 0.01: cambios.append(f"Com: {sheet_comision}->{nueva_comision}")
                         
                         log_reporte.append([it_id, " | ".join(cambios), fecha_mod_ml.strftime("%d/%m/%Y %H:%M")])
                 except: continue
 
-    # --- ENVIAR RESUMEN A DISCORD ---
-    if alertas_para_discord:
-        chunks_alertas = [alertas_para_discord[x:x+15] for x in range(0, len(alertas_para_discord), 15)]
-        for grupo in chunks_alertas:
-            texto_alertas = "\n".join(grupo)
-            mensaje_final = (
-                f"⚠️ **RESUMEN DE PAUSAS EN FULL ({datetime.now().strftime('%H:%M')})** ⚠️\n"
-                f"```yaml\n"
-                f"{texto_alertas}\n"
-                f"```"
-            )
-            enviar_alerta_discord(mensaje_final)
-
-    # --- GUARDAR RESULTADOS EN GOOGLE SHEETS ---
+    # --- GUARDAR EN GOOGLE SHEETS ---
     if hubo_cambios:
-        # Aseguramos que todas las columnas se guarden como texto para evitar errores de formato
         worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist(), 'A1')
-        
         if log_reporte:
             h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
-            if h_ws is None:
-                h_ws = sh.add_worksheet(title=HISTORY_SHEET, rows="5000", cols="3")
-                h_ws.append_row(["Item ID", "Cual fue el cambio", "Ultima Modificacion ML"])
-            
-            actualizar_historial_limpio(h_ws, log_reporte)
+            if h_ws: actualizar_historial_limpio(h_ws, log_reporte)
+
+    # --- ENVÍO A DISCORD ---
+    if alertas_para_discord:
+        for grupo in [alertas_para_discord[x:x+15] for x in range(0, len(alertas_para_discord), 15)]:
+            enviar_alerta_discord(f"⚠️ **RESUMEN DE CAMBIOS ({datetime.now().strftime('%H:%M')})** ⚠️\n```yaml\n" + "\n".join(grupo) + "\n```")
 
 if __name__ == "__main__":
     run_update()
