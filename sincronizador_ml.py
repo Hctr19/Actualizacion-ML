@@ -35,13 +35,26 @@ def get_new_token(config_ws):
     except: return None
 
 def get_data(i_id, token):
-    """Obtiene detalles del item y precio promocional."""
+    """
+    Obtiene detalles del item, precio promocional y COMISIONES.
+    Se incluye el parámetro 'price' en sale_fee para considerar costos fijos en <$299.
+    """
     headers = {'Authorization': f'Bearer {token}'}
     try:
+        # 1. Datos básicos del item
         it = requests.get(f"https://api.mercadolibre.com/items/{i_id}", headers=headers, timeout=15).json()
+        
+        # 2. Precio promocional/actual
         sp = requests.get(f"https://api.mercadolibre.com/items/{i_id}/sale_price", headers=headers, timeout=15).json()
         p_promo = sp.get('amount') or it.get('price') or 0
-        return {'body': it, 'promo_price': p_promo}
+        
+        # 3. Consulta de Comisión (Considera tipo de publicación y costos fijos)
+        # Enviamos el precio actual para que el cálculo sea exacto
+        sf_url = f"https://api.mercadolibre.com/items/{i_id}/sale_fee?price={p_promo}"
+        sf = requests.get(sf_url, headers=headers, timeout=15).json()
+        comision = sf.get('sale_fee_amount', 0)
+        
+        return {'body': it, 'promo_price': p_promo, 'comision': comision}
     except: return None
 
 def enviar_alerta_discord(mensaje):
@@ -92,7 +105,7 @@ def run_update():
         print("Error: No se pudo refrescar el token de ML")
         return
 
-    # --- OBTENER DATOS DE LA HOJA 'ML' ---
+    # --- OBTENER DATOS DE LA HOJA 'PUBLICACIONES' ---
     worksheet = sh.worksheet(SHEET_NAME)
     df = pd.DataFrame(worksheet.get_all_records()).fillna('')
     unique_ids = df['Item ID'].unique().tolist()
@@ -118,7 +131,6 @@ def run_update():
             item = data['body']
             v_id = str(row['Variant ID']).strip()
 
-            # --- NUEVO: OBTENER LOGÍSTICA ---
             logistica_real = item.get('shipping', {}).get('logistic_type', 'not_specified')
             sheet_logistica = str(row.get('Logistica', '')).strip()
 
@@ -131,12 +143,12 @@ def run_update():
 
             es_full = logistica_real == 'fulfillment'
             
-            # --- TRADUCTOR ESTATUS ---
+            # Estatus
             api_status = item.get('status') 
             nuevo_estatus = "Activa" if api_status == 'active' and stock_real > 0 else "Pausada"
             sheet_estatus = str(row['Estatus']).strip().capitalize() 
 
-            # --- SUB-STATUS Y MODERACIONES ---
+            # Sub-status y moderaciones
             sub_status_list = item.get('sub_status', [])
             sub_status_str = ", ".join(sub_status_list) if sub_status_list else "N/A"
             
@@ -153,20 +165,22 @@ def run_update():
                     titulo_caja = item.get('title', 'Producto')[:30]
                     alertas_para_discord.append(f"• {it_id} | {titulo_caja:<30} | {razon}")
                     
-            # --- DETECCIÓN DE CAMBIOS ---
+            # --- DETECCIÓN DE CAMBIOS (Incluye Comisión) ---
             nuevo_p_promo = float(data.get('promo_price') or 0.0)
             nuevo_stock = int(stock_real) if es_full else 0
             nuevo_p_base = float(item.get('original_price') or item.get('price') or 0.0)
+            nueva_comision = float(data.get('comision') or 0.0)
             
             sheet_promo = float(row['Precio Promo']) if row['Precio Promo'] != '' else 0.0
             sheet_stock = int(row['Stock (Solo Full)']) if row['Stock (Solo Full)'] != '' else 0
+            sheet_comision = float(row.get('Comision', 0)) if row.get('Comision', '') != '' else 0.0
 
-            # Verificamos si cambió algo, incluyendo la logística
             cambio_en_fila = (
                 (sheet_estatus != nuevo_estatus) or 
                 (abs(sheet_promo - nuevo_p_promo) > 0.01) or 
                 (sheet_stock != nuevo_stock) or
-                (sheet_logistica != logistica_real)
+                (sheet_logistica != logistica_real) or
+                (abs(sheet_comision - nueva_comision) > 0.01)
             )
 
             if cambio_en_fila:
@@ -174,7 +188,8 @@ def run_update():
                 df.at[i, 'Precio Promo'] = nuevo_p_promo
                 df.at[i, 'Stock (Solo Full)'] = nuevo_stock
                 df.at[i, 'Estatus'] = nuevo_estatus
-                df.at[i, 'Logistica'] = logistica_real # Actualiza la columna H
+                df.at[i, 'Logistica'] = logistica_real
+                df.at[i, 'Comision'] = nueva_comision # Se inserta en la columna correspondiente
                 hubo_cambios = True
 
                 last_up_str = item.get('last_updated', '').replace('Z', '+00:00')
@@ -186,9 +201,23 @@ def run_update():
                         if sheet_stock != nuevo_stock: cambios.append(f"Stock: {sheet_stock}->{nuevo_stock}")
                         if sheet_logistica != logistica_real: cambios.append(f"Log: {sheet_logistica}->{logistica_real}")
                         if abs(sheet_promo - nuevo_p_promo) > 0.01: cambios.append(f"P: {sheet_promo}->{nuevo_p_promo}")
+                        if abs(sheet_comision - nueva_comision) > 0.01: cambios.append(f"Com: {sheet_comision}->{nueva_comision}")
                         
                         log_reporte.append([it_id, " | ".join(cambios), fecha_mod_ml.strftime("%d/%m/%Y %H:%M")])
                 except: continue
+
+    # --- GUARDAR RESULTADOS EN GOOGLE SHEETS ---
+    if hubo_cambios:
+        # Volcar todo el DataFrame actualizado a la hoja
+        worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist(), 'A1')
+        
+        if log_reporte:
+            h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
+            if h_ws is None:
+                h_ws = sh.add_worksheet(title=HISTORY_SHEET, rows="5000", cols="3")
+                h_ws.append_row(["Item ID", "Cual fue el cambio", "Ultima Modificacion ML"])
+            
+            actualizar_historial_limpio(h_ws, log_reporte)
 
     # --- ENVIAR RESUMEN A DISCORD ---
     if alertas_para_discord:
@@ -202,18 +231,6 @@ def run_update():
                 f"```"
             )
             enviar_alerta_discord(mensaje_final)
-
-    # --- GUARDAR RESULTADOS EN GOOGLE SHEETS ---
-    if hubo_cambios:
-        worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist(), 'A1')
-        
-        if log_reporte:
-            h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
-            if h_ws is None:
-                h_ws = sh.add_worksheet(title=HISTORY_SHEET, rows="5000", cols="3")
-                h_ws.append_row(["Item ID", "Cual fue el cambio", "Ultima Modificacion ML"])
-            
-            actualizar_historial_limpio(h_ws, log_reporte)
 
 if __name__ == "__main__":
     run_update()
