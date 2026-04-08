@@ -206,7 +206,6 @@ def run_update():
             
             h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
             if h_ws and log_reporte:
-                # Función simplificada de historial para evitar errores
                 h_ws.append_rows(log_reporte)
         except Exception as e:
             print(f"❌ Error al guardar en Sheets: {e}")
