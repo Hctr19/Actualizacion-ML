@@ -79,7 +79,7 @@ def get_data(i_id, token):
             comision = res_sf.json().get('sale_fee_amount', 0.0)
         else:
             print(f"⚠️ No se pudo obtener comisión para {i_id} (Status: {res_sf.status_code})")
-            # Podríamos intentar sin el parámetro price como fallback
+            # Fallback sin parámetro de precio
             res_sf_fallback = requests.get(f"https://api.mercadolibre.com/items/{i_id}/sale_fee", headers=headers, timeout=15)
             if res_sf_fallback.status_code == 200:
                 comision = res_sf_fallback.json().get('sale_fee_amount', 0.0)
@@ -167,8 +167,7 @@ def run_update():
             sheet_stock = clean_int(row.get('Stock (Solo Full)'))
             sheet_comision = clean_float(row.get('Comision'))
 
-            # Solo marcar cambio si el nuevo valor NO es cero (o si realmente bajó a cero el stock)
-            # Esto evita que errores de API borren tus precios
+            # Solo marcar cambio si el nuevo valor NO es cero (protección)
             cambio_en_fila = (
                 (sheet_estatus != nuevo_estatus) or 
                 (abs(sheet_promo - nuevo_p_promo) > 0.01 and nuevo_p_promo > 0) or 
