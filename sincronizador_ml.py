@@ -20,19 +20,37 @@ HORAS_ATRAS = 48
 DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL')
 
 def get_new_token(config_ws):
-    """Refresca el token de acceso de Mercado Libre."""
+    """Refresca el token de acceso de Mercado Libre con depuración activa."""
     try:
+        # Extraer credenciales limpiando espacios y formatos extraños
         c_id = str(config_ws.acell('A2').value).replace(',', '').replace(' ', '').strip()
         c_secret = str(config_ws.acell('B2').value).strip()
         r_token = str(config_ws.acell('C2').value).strip()
+        
+        print(f"🔍 [DEBUG] Intentando refrescar token... Client ID detectado: {c_id}")
+        
         url = "https://api.mercadolibre.com/oauth/token"
-        res = requests.post(url, data={'grant_type': 'refresh_token', 'client_id': c_id, 'client_secret': c_secret, 'refresh_token': r_token})
+        res = requests.post(url, data={
+            'grant_type': 'refresh_token', 
+            'client_id': c_id, 
+            'client_secret': c_secret, 
+            'refresh_token': r_token
+        })
+        
+        print(f"🔍 [DEBUG] Código de estado de Mercado Libre: {res.status_code}")
+        
         if res.status_code == 200:
             token_data = res.json()
+            # Guardamos el nuevo refresh token devuelto por la API
             config_ws.update_acell('C2', token_data['refresh_token'])
+            print("✅ Token refrescado y guardado con éxito en la celda C2.")
             return token_data['access_token']
+        else:
+            print(f"❌ Error de la API de Mercado Libre: {res.text}")
+            return None
+    except Exception as e: 
+        print(f"❌ Error interno al intentar leer la hoja o conectar con la API: {str(e)}")
         return None
-    except: return None
 
 def get_data(i_id, token):
     """Obtiene detalles del item, precio promocional y comisión basada en el precio real de venta."""
@@ -110,7 +128,7 @@ def run_update():
     # --- REFRESH TOKEN ML ---
     access_token = get_new_token(sh.worksheet(CONFIG_SHEET))
     if not access_token: 
-        print("Error: No se pudo refrescar el token de ML")
+        print("Error: No se pudo refrescar el token de ML. Deteniendo la ejecución.")
         return
 
     # --- OBTENER DATOS DE LA HOJA ---
