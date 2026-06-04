@@ -2,3 +2,4 @@ pandas
 requests
 gspread
 pytz
+python-dotenv

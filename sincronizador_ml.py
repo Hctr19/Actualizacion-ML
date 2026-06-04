@@ -6,6 +6,37 @@ import os
 import json
 from datetime import datetime, timedelta
 import pytz
+from dotenv import load_dotenv
+import sys
+
+# Configurar la consola para soportar caracteres UTF-8 (emojis) en Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except:
+        pass
+
+# Cargar variables de entorno desde el archivo .env o uno especificado por argumento --env si no están ya en el sistema
+if 'SPREADSHEET_ID' not in os.environ:
+    env_file = ".env"
+    if "--env" in sys.argv:
+        try:
+            idx = sys.argv.index("--env")
+            if idx + 1 < len(sys.argv):
+                env_file = sys.argv[idx + 1]
+                # Eliminar los argumentos del entorno para no interferir
+                sys.argv.pop(idx + 1)
+                sys.argv.pop(idx)
+        except ValueError:
+            pass
+
+    print(f"ℹ️ [DEBUG] Cargando variables desde: {env_file}")
+    load_dotenv(env_file)
 
 # --- CONFIGURACIÓN PRINCIPAL ---
 SPREADSHEET_ID = os.environ['SPREADSHEET_ID'] 
@@ -53,11 +84,13 @@ def get_new_token(config_ws):
         return None
 
 def get_data(i_id, token):
-    """Obtiene detalles del item, precio promocional y comisión basada en el precio real de venta."""
+    """Obtiene detalles del item, precio promocional, comisión y costo de envío."""
     headers = {'Authorization': f'Bearer {token}'}
     try:
         # Detalle del ítem
         it_res = requests.get(f"https://api.mercadolibre.com/items/{i_id}", headers=headers, timeout=15)
+        if it_res.status_code != 200:
+            return None
         it = it_res.json()
         
         # Precio promocional (el que ve el cliente)
@@ -80,7 +113,26 @@ def get_data(i_id, token):
             elif isinstance(comm_res, dict):
                 comision = comm_res.get('sale_fee_amount', 0)
 
-        return {'body': it, 'promo_price': p_promo, 'comision': comision}
+        # --- CONSULTA DE COSTO DE ENVÍO ---
+        shipping_cost = None
+        try:
+            ship_url = f"https://api.mercadolibre.com/items/{i_id}/shipping_options"
+            ship_res = requests.get(ship_url, headers=headers, timeout=10)
+            if ship_res.status_code == 200:
+                ship_data = ship_res.json()
+                options = ship_data.get('options', [])
+                # Intentar buscar la opción con free_shipping = True
+                for opt in options:
+                    if opt.get('free_shipping') is True:
+                        shipping_cost = float(opt.get('list_cost', 0.0))
+                        break
+                # Si no hay envío gratis, tomar el list_cost de la primera opción
+                if shipping_cost is None and options:
+                    shipping_cost = float(options[0].get('list_cost', 0.0))
+        except Exception as e:
+            print(f"⚠️ [DEBUG] No se pudo obtener el costo de envío para {i_id}: {str(e)}")
+
+        return {'body': it, 'promo_price': p_promo, 'comision': comision, 'shipping_cost': shipping_cost}
     except: return None
 
 def enviar_alerta_discord(mensaje):
@@ -132,17 +184,33 @@ def run_update():
         return
 
     # --- OBTENER DATOS DE LA HOJA ---
+    print("🔍 [DEBUG] Obteniendo registros de la pestaña 'PUBLICACIONES'...")
     worksheet = sh.worksheet(SHEET_NAME)
     df = pd.DataFrame(worksheet.get_all_records()).fillna('')
-    unique_ids = df['Item ID'].unique().tolist()
+    
+    # Omitir de la consulta los registros cuyo Estatus en la hoja sea 'Cerrada'
+    df_a_consultar = df[df['Estatus'].astype(str).str.strip().str.capitalize() != 'Cerrada']
+    unique_ids = df_a_consultar['Item ID'].unique().tolist()
+    # Limpiar IDs vacíos si existen
+    unique_ids = [str(x).strip() for x in unique_ids if x]
+    print(f"✅ [DEBUG] Datos de la hoja cargados. Filas totales: {len(df)}. IDs únicos a consultar (excluyendo 'Cerrada'): {len(unique_ids)}")
 
     # --- DESCARGA CONCURRENTE ---
     item_details = {}
+    total_ids = len(unique_ids)
+    print(f"🔍 [DEBUG] Descargando información de {total_ids} items desde la API de Mercado Libre...")
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
         f_to_id = {executor.submit(get_data, i_id, access_token): i_id for i_id in unique_ids}
+        completed_count = 0
         for f in concurrent.futures.as_completed(f_to_id):
             res = f.result()
-            if res: item_details[f_to_id[f]] = res
+            if res: 
+                item_details[f_to_id[f]] = res
+            completed_count += 1
+            if completed_count % 100 == 0 or completed_count == total_ids:
+                print(f"⏳ [DEBUG] Progreso: {completed_count}/{total_ids} items descargados...")
+
 
     log_reporte = []
     alertas_para_discord = [] 
@@ -169,21 +237,42 @@ def run_update():
                 stock_real = item.get('available_quantity', 0)
 
             es_full = logistica_real == 'fulfillment'
-            api_status = item.get('status') 
-            nuevo_estatus = "Activa" if api_status == 'active' and stock_real > 0 else "Pausada"
+            # Nuevo Estatus (Nuevo mapeo con relación y condición de stock activa)
+            api_status = item.get('status')
+            if not isinstance(api_status, str):
+                api_status = str(api_status) if api_status is not None else ""
+            sub_status_list = item.get('sub_status', [])
+            es_revision = "under_review" in sub_status_list or "waiting_for_patch" in sub_status_list or api_status == 'under_review'
+            
+            if es_revision:
+                nuevo_estatus = "Bajo revision"
+            elif api_status == 'active':
+                nuevo_estatus = "Activa" if stock_real > 0 else "Pausada"
+            elif api_status == 'paused':
+                nuevo_estatus = "Pausada"
+            elif api_status == 'closed':
+                nuevo_estatus = "Cerrada"
+            else:
+                nuevo_estatus = api_status.capitalize() if api_status else "Pausada"
+
             sheet_estatus = str(row['Estatus']).strip().capitalize() 
 
-            # Sub-status
-            sub_status_list = item.get('sub_status', [])
+            # Sub-status para Discord
             sub_status_str = ", ".join(sub_status_list) if sub_status_list else "N/A"
-            
             if sheet_estatus == "Activa":
-                es_revision = "under_review" in sub_status_list or "waiting_for_patch" in sub_status_list
                 if nuevo_estatus == "Pausada" or es_revision:
                     razon = f"⚠️ REVISIÓN ({sub_status_str})" if es_revision else f"Pausada ({sub_status_str})"
                     titulo_caja = item.get('title', 'Producto')[:30]
                     alertas_para_discord.append(f"• {it_id} | {titulo_caja:<30} | {razon}")
                     
+            # Costo de Envío (actualización y preservación)
+            nuevo_p_envio = data.get('shipping_cost')
+            sheet_envio = float(row['CostoEnvio']) if row.get('CostoEnvio', '') != '' else 0.0
+            
+            # Si la API no devolvió costo (por estar pausada/cerrada/error), mantenemos el costo actual en la hoja
+            if nuevo_p_envio is None:
+                nuevo_p_envio = sheet_envio
+
             # Detección de cambios
             nuevo_p_promo = float(data.get('promo_price') or 0.0)
             nuevo_stock = int(stock_real) if es_full else 0
@@ -198,7 +287,8 @@ def run_update():
                 (abs(sheet_promo - nuevo_p_promo) > 0.01) or 
                 (sheet_stock != nuevo_stock) or
                 (sheet_logistica != logistica_real) or
-                (abs(sheet_comision - nueva_comision) > 0.01)
+                (abs(sheet_comision - nueva_comision) > 0.01) or
+                (abs(sheet_envio - nuevo_p_envio) > 0.01)
             )
 
             if cambio_en_fila:
@@ -208,6 +298,7 @@ def run_update():
                 df.at[i, 'Estatus'] = nuevo_estatus
                 df.at[i, 'Logistica'] = logistica_real
                 df.at[i, 'Comision'] = nueva_comision
+                df.at[i, 'CostoEnvio'] = nuevo_p_envio
                 hubo_cambios = True
 
                 last_up_str = item.get('last_updated', '').replace('Z', '+00:00')
@@ -219,21 +310,34 @@ def run_update():
                         if sheet_stock != nuevo_stock: cambios.append(f"Stock: {sheet_stock}->{nuevo_stock}")
                         if abs(sheet_promo - nuevo_p_promo) > 0.01: cambios.append(f"P: {sheet_promo}->{nuevo_p_promo}")
                         if abs(sheet_comision - nueva_comision) > 0.01: cambios.append(f"Com: {sheet_comision}->{nueva_comision}")
+                        if abs(sheet_envio - nuevo_p_envio) > 0.01: cambios.append(f"Envio: {sheet_envio}->{nuevo_p_envio}")
                         
                         log_reporte.append([it_id, " | ".join(cambios), fecha_mod_ml.strftime("%d/%m/%Y %H:%M")])
                 except: continue
 
     # --- GUARDAR EN GOOGLE SHEETS ---
     if hubo_cambios:
-        worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist(), 'A1')
+        print("🔍 [DEBUG] Detectados cambios en los productos. Guardando actualización en Google Sheets...")
+        df_cleaned = df.fillna("").astype(str).values.tolist()
+        worksheet.update(values=[df.columns.values.tolist()] + df_cleaned, range_name='A1')
+        print("✅ [DEBUG] Hoja 'PUBLICACIONES' actualizada con éxito.")
         if log_reporte:
+            print(f"🔍 [DEBUG] Escribiendo {len(log_reporte)} registros en el Historial...")
             h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
-            if h_ws: actualizar_historial_limpio(h_ws, log_reporte)
+            if h_ws: 
+                actualizar_historial_limpio(h_ws, log_reporte)
+                print("✅ [DEBUG] Historial actualizado.")
+    else:
+        print("🔍 [DEBUG] No se detectó ningún cambio. La hoja de cálculo está al día.")
 
     # --- ENVÍO A DISCORD ---
     if alertas_para_discord:
+        print(f"🔍 [DEBUG] Enviando {len(alertas_para_discord)} alertas a Discord...")
         for grupo in [alertas_para_discord[x:x+15] for x in range(0, len(alertas_para_discord), 15)]:
             enviar_alerta_discord(f"⚠️ **RESUMEN DE CAMBIOS ({datetime.now().strftime('%H:%M')})** ⚠️\n```yaml\n" + "\n".join(grupo) + "\n```")
+        print("✅ [DEBUG] Alertas enviadas a Discord.")
+
+    print("🎉 [DEBUG] Proceso de sincronización finalizado exitosamente.")
 
 if __name__ == "__main__":
     run_update()

@@ -1,0 +1,23 @@
+name: Sync MercadoLibre Tienda 2
+on:
+  schedule:
+    # Lunes a Sábado de 8:30 AM a 5:30 PM local (14:30 a 23:30 UTC)
+    - cron: '30 14-23 * * 1-6'
+    # Lunes a Sábado a las 6:30 PM local (Martes a Domingo a las 00:30 UTC)
+    - cron: '30 0 * * 0,2-6'
+  workflow_dispatch: # Botón manual en GitHub
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_TIENDA2 }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_TIENDA2 }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL_TIENDA2 }}
+        run: python sincronizador_ml.py
