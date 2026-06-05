@@ -83,6 +83,25 @@ def get_new_token(config_ws):
         print(f"❌ Error interno al intentar leer la hoja o conectar con la API: {str(e)}")
         return None
 
+def obtener_sku(item_or_variation):
+    """Busca el SKU (SELLER_SKU) dentro de los atributos o en seller_custom_field."""
+    if not item_or_variation:
+        return ''
+    # 1. Intentar buscar en attributes con id 'SELLER_SKU'
+    attrs = item_or_variation.get('attributes', [])
+    for attr in attrs:
+        if attr.get('id') == 'SELLER_SKU':
+            val = str(attr.get('value_name') or attr.get('value_struct', '') or '').strip()
+            if val:
+                return val
+                
+    # 2. Si no se encontró o está vacío, intentar seller_custom_field
+    custom_field = item_or_variation.get('seller_custom_field')
+    if custom_field:
+        return str(custom_field).strip()
+        
+    return ''
+
 def get_data(i_id, token):
     """Obtiene detalles del item, precio promocional, comisión y costo de envío."""
     headers = {'Authorization': f'Bearer {token}'}
@@ -148,7 +167,7 @@ def enviar_alerta_discord(mensaje):
 def actualizar_historial_limpio(h_ws, nuevos_logs):
     """Filtra y actualiza la hoja de historial manteniendo el orden cronológico."""
     datos_actuales = h_ws.get_all_values()
-    encabezado = ["Item ID", "Cual fue el cambio", "Ultima Modificacion ML"]
+    encabezado = ["ID_UNICO_VARIANTE", "Cual fue el cambio", "Ultima Modificacion ML"]
     registros_validos = []
     limite_tiempo = datetime.now() - timedelta(hours=HORAS_ATRAS)
     formato_fecha = "%d/%m/%Y %H:%M"
@@ -169,11 +188,12 @@ def actualizar_historial_limpio(h_ws, nuevos_logs):
 
     todos_limitados = todos[:5000]
     h_ws.clear()
-    h_ws.update([encabezado] + todos_limitados, 'A1')
+    h_ws.update(values=[encabezado] + todos_limitados, range_name='A1')
 
 def run_update():
     # --- AUTENTICACIÓN GOOGLE ---
-    sa_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+    sa_env = os.environ['GOOGLE_SERVICE_ACCOUNT'].strip().strip("'\"")
+    sa_info = json.loads(sa_env)
     gc = gspread.service_account_from_dict(sa_info)
     sh = gc.open_by_key(SPREADSHEET_ID)
     
@@ -273,6 +293,23 @@ def run_update():
             if nuevo_p_envio is None:
                 nuevo_p_envio = sheet_envio
 
+            # Título y SKU reales de la API
+            api_titulo = item.get('title', '').strip()
+            
+            # Obtener el SKU de la variación o del item principal
+            if v_id and v_id not in ['0', '', 'None']:
+                v_data = next((v for v in item.get('variations', []) if str(v.get('id')) == v_id), None)
+                api_sku = obtener_sku(v_data) if v_data else obtener_sku(item)
+            else:
+                api_sku = obtener_sku(item)
+                
+            sheet_titulo = str(row.get('Titulo', '')).strip()
+            sheet_sku = str(row.get('Att_SellerSKU', '')).strip()
+
+            # Solo detectar cambios si la API devuelve un valor no vacío (para evitar borrar datos locales válidos)
+            titulo_cambio = bool(api_titulo and sheet_titulo != api_titulo)
+            sku_cambio = bool(api_sku and sheet_sku != api_sku)
+
             # Detección de cambios
             nuevo_p_promo = float(data.get('promo_price') or 0.0)
             nuevo_stock = int(stock_real) if es_full else 0
@@ -288,7 +325,9 @@ def run_update():
                 (sheet_stock != nuevo_stock) or
                 (sheet_logistica != logistica_real) or
                 (abs(sheet_comision - nueva_comision) > 0.01) or
-                (abs(sheet_envio - nuevo_p_envio) > 0.01)
+                (abs(sheet_envio - nuevo_p_envio) > 0.01) or
+                titulo_cambio or
+                sku_cambio
             )
 
             if cambio_en_fila:
@@ -299,6 +338,10 @@ def run_update():
                 df.at[i, 'Logistica'] = logistica_real
                 df.at[i, 'Comision'] = nueva_comision
                 df.at[i, 'CostoEnvio'] = nuevo_p_envio
+                if titulo_cambio:
+                    df.at[i, 'Titulo'] = api_titulo
+                if sku_cambio:
+                    df.at[i, 'Att_SellerSKU'] = api_sku
                 hubo_cambios = True
 
                 last_up_str = item.get('last_updated', '').replace('Z', '+00:00')
@@ -311,8 +354,12 @@ def run_update():
                         if abs(sheet_promo - nuevo_p_promo) > 0.01: cambios.append(f"P: {sheet_promo}->{nuevo_p_promo}")
                         if abs(sheet_comision - nueva_comision) > 0.01: cambios.append(f"Com: {sheet_comision}->{nueva_comision}")
                         if abs(sheet_envio - nuevo_p_envio) > 0.01: cambios.append(f"Envio: {sheet_envio}->{nuevo_p_envio}")
+                        if titulo_cambio: cambios.append(f"Titulo: {sheet_titulo}->{api_titulo}")
+                        if sku_cambio: cambios.append(f"SKU: {sheet_sku}->{api_sku}")
                         
-                        log_reporte.append([it_id, " | ".join(cambios), fecha_mod_ml.strftime("%d/%m/%Y %H:%M")])
+                        v_clean = v_id if v_id and v_id not in ['0', '', 'None'] else ""
+                        id_unico = f"{it_id}_{v_clean}"
+                        log_reporte.append([id_unico, " | ".join(cambios), fecha_mod_ml.strftime("%d/%m/%Y %H:%M")])
                 except: continue
 
     # --- GUARDAR EN GOOGLE SHEETS ---

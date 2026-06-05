@@ -34,7 +34,7 @@ if 'SPREADSHEET_ID' not in os.environ:
 
 # Importar configuraciones y helpers desde el sincronizador principal
 from sincronizador_ml import (
-    get_new_token, get_data, SPREADSHEET_ID, SHEET_NAME, CONFIG_SHEET
+    get_new_token, get_data, SPREADSHEET_ID, SHEET_NAME, CONFIG_SHEET, obtener_sku
 )
 
 def obtener_user_id(token):
@@ -90,18 +90,12 @@ def obtener_todos_items_api(user_id, token):
             
     return list(set(item_ids))
 
-def obtener_sku(item_or_variation):
-    """Busca el SKU (SELLER_SKU) dentro de los atributos del item o variación."""
-    attrs = item_or_variation.get('attributes', [])
-    for attr in attrs:
-        if attr.get('id') == 'SELLER_SKU':
-            return str(attr.get('value_name') or attr.get('value_struct', '') or '').strip()
-    return ''
 
 def run_conciliation():
     # --- AUTENTICACIÓN GOOGLE ---
     print("🔍 [DEBUG] Iniciando conexión con Google Sheets...")
-    sa_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+    sa_env = os.environ['GOOGLE_SERVICE_ACCOUNT'].strip().strip("'\"")
+    sa_info = json.loads(sa_env)
     gc = gspread.service_account_from_dict(sa_info)
     sh = gc.open_by_key(SPREADSHEET_ID)
     
