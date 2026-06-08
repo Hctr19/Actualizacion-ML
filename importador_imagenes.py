@@ -14,10 +14,9 @@ if hasattr(sys.stdout, 'reconfigure'):
     except:
         pass
 
-# Cargar variables de entorno desde el archivo .env
-load_dotenv(".env")
-
-# Importar configuraciones y helpers desde sincronizador_ml
+# Importar configuraciones y helpers desde sincronizador_ml.
+# Al importar sincronizador_ml, este se encarga automáticamente de procesar
+# el argumento --env (por ejemplo: --env .env.tienda2) y cargar el archivo correspondiente.
 sys.path.append(".")
 from sincronizador_ml import get_new_token, SPREADSHEET_ID
 
