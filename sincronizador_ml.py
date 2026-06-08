@@ -23,12 +23,17 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 # Cargar variables de entorno desde el archivo .env o uno especificado por argumento --env si no están ya en el sistema
 if 'SPREADSHEET_ID' not in os.environ:
-    env_file = ".env"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_file = os.path.join(script_dir, ".env")
     if "--env" in sys.argv:
         try:
             idx = sys.argv.index("--env")
             if idx + 1 < len(sys.argv):
-                env_file = sys.argv[idx + 1]
+                env_file_arg = sys.argv[idx + 1]
+                if not os.path.isabs(env_file_arg):
+                    env_file = os.path.join(script_dir, env_file_arg)
+                else:
+                    env_file = env_file_arg
                 # Eliminar los argumentos del entorno para no interferir
                 sys.argv.pop(idx + 1)
                 sys.argv.pop(idx)
