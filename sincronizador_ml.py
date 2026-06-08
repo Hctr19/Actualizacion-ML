@@ -40,6 +40,11 @@ if 'SPREADSHEET_ID' not in os.environ:
         except ValueError:
             pass
 
+    if not os.path.exists(env_file):
+        print(f"❌ Error: El archivo de configuración '{env_file}' no existe en esta computadora.")
+        print("Para poder ejecutar el script para la Tienda 2 de forma local, debes crear ese archivo con las credenciales de la Tienda 2.")
+        sys.exit(1)
+
     print(f"ℹ️ [DEBUG] Cargando variables desde: {env_file}")
     load_dotenv(env_file)
 
