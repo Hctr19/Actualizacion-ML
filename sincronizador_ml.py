@@ -196,39 +196,46 @@ def get_data(i_id, token, user_id=None):
 
         # --- CONSULTA DE COSTO DE ENVÍO ---
         shipping_cost = None
-        if user_id:
-            try:
-                # Usar el endpoint de simulación de costo de envío gratis del vendedor
-                ship_url = f"https://api.mercadolibre.com/users/{user_id}/shipping_options/free?item_id={i_id}"
-                ship_res = requests.get(ship_url, headers=headers, timeout=10)
-                if ship_res.status_code == 200:
-                    ship_data = ship_res.json()
-                    coverage = ship_data.get('coverage', {})
-                    all_country = coverage.get('all_country', {})
-                    shipping_cost = all_country.get('list_cost')
-                    if shipping_cost is not None:
-                        shipping_cost = float(shipping_cost)
-            except Exception as e:
-                print(f"⚠️ [DEBUG] No se pudo obtener el costo de envío con el nuevo endpoint para {i_id}: {str(e)}")
+        shipping_info = it.get('shipping', {})
+        shipping_mode = shipping_info.get('mode')
+        is_free_shipping = shipping_info.get('free_shipping', False)
 
-        # Fallback al método anterior si no se obtuvo con el nuevo endpoint o si no hay user_id
-        if shipping_cost is None:
-            try:
-                ship_url = f"https://api.mercadolibre.com/items/{i_id}/shipping_options"
-                ship_res = requests.get(ship_url, headers=headers, timeout=10)
-                if ship_res.status_code == 200:
-                    ship_data = ship_res.json()
-                    options = ship_data.get('options', [])
-                    # Intentar buscar la opción con free_shipping = True
-                    for opt in options:
-                        if opt.get('free_shipping') is True:
-                            shipping_cost = float(opt.get('list_cost', 0.0))
-                            break
-                    # Si no hay envío gratis, tomar el list_cost de la primera opción
-                    if shipping_cost is None and options:
-                        shipping_cost = float(options[0].get('list_cost', 0.0))
-            except Exception as e:
-                print(f"⚠️ [DEBUG] Fallback: No se pudo obtener el costo de envío para {i_id}: {str(e)}")
+        if shipping_mode == 'me2' and (is_free_shipping or (p_promo and p_promo < 299)):
+            if user_id:
+                try:
+                    # Usar el endpoint de simulación de costo de envío gratis del vendedor
+                    ship_url = f"https://api.mercadolibre.com/users/{user_id}/shipping_options/free?item_id={i_id}"
+                    ship_res = requests.get(ship_url, headers=headers, timeout=10)
+                    if ship_res.status_code == 200:
+                        ship_data = ship_res.json()
+                        coverage = ship_data.get('coverage', {})
+                        all_country = coverage.get('all_country', {})
+                        shipping_cost = all_country.get('list_cost')
+                        if shipping_cost is not None:
+                            shipping_cost = float(shipping_cost)
+                except Exception as e:
+                    print(f"⚠️ [DEBUG] No se pudo obtener el costo de envío con el nuevo endpoint para {i_id}: {str(e)}")
+
+            # Fallback al método anterior si no se obtuvo con el nuevo endpoint o si no hay user_id
+            if shipping_cost is None:
+                try:
+                    ship_url = f"https://api.mercadolibre.com/items/{i_id}/shipping_options"
+                    ship_res = requests.get(ship_url, headers=headers, timeout=10)
+                    if ship_res.status_code == 200:
+                        ship_data = ship_res.json()
+                        options = ship_data.get('options', [])
+                        # Intentar buscar la opción con free_shipping = True
+                        for opt in options:
+                            if opt.get('free_shipping') is True:
+                                shipping_cost = float(opt.get('list_cost', 0.0))
+                                break
+                        # Si no hay envío gratis, tomar el list_cost de la primera opción
+                        if shipping_cost is None and options:
+                            shipping_cost = float(options[0].get('list_cost', 0.0))
+                except Exception as e:
+                    print(f"⚠️ [DEBUG] Fallback: No se pudo obtener el costo de envío para {i_id}: {str(e)}")
+        else:
+            shipping_cost = ""
 
         return {'body': it, 'promo_price': p_promo, 'comision': comision, 'shipping_cost': shipping_cost}
     except: return None
@@ -378,11 +385,23 @@ def run_update():
                     
             # Costo de Envío (actualización y preservación)
             nuevo_p_envio = data.get('shipping_cost')
-            sheet_envio = float(row['CostoEnvio']) if row.get('CostoEnvio', '') != '' else 0.0
             
             # Si la API no devolvió costo (por estar pausada/cerrada/error), mantenemos el costo actual en la hoja
             if nuevo_p_envio is None:
-                nuevo_p_envio = sheet_envio
+                nuevo_p_envio = row.get('CostoEnvio', '')
+
+            # Comparación segura de flotantes
+            try:
+                sheet_envio_val = float(row.get('CostoEnvio', 0.0)) if row.get('CostoEnvio', '') != '' else 0.0
+            except:
+                sheet_envio_val = 0.0
+
+            try:
+                nuevo_envio_val = float(nuevo_p_envio) if nuevo_p_envio not in ['', None] else 0.0
+            except:
+                nuevo_envio_val = 0.0
+
+            envio_cambio = (abs(sheet_envio_val - nuevo_envio_val) > 0.01)
 
             # Título y SKU reales de la API
             api_titulo = item.get('title', '').strip()
@@ -416,7 +435,7 @@ def run_update():
                 (sheet_stock != nuevo_stock) or
                 (sheet_logistica != logistica_real) or
                 (abs(sheet_comision - nueva_comision) > 0.01) or
-                (abs(sheet_envio - nuevo_p_envio) > 0.01) or
+                envio_cambio or
                 titulo_cambio or
                 sku_cambio
             )
@@ -444,7 +463,7 @@ def run_update():
                         if sheet_stock != nuevo_stock: cambios.append(f"Stock: {sheet_stock}->{nuevo_stock}")
                         if abs(sheet_promo - nuevo_p_promo) > 0.01: cambios.append(f"P: {sheet_promo}->{nuevo_p_promo}")
                         if abs(sheet_comision - nueva_comision) > 0.01: cambios.append(f"Com: {sheet_comision}->{nueva_comision}")
-                        if abs(sheet_envio - nuevo_p_envio) > 0.01: cambios.append(f"Envio: {sheet_envio}->{nuevo_p_envio}")
+                        if envio_cambio: cambios.append(f"Envio: {sheet_envio_val}->{nuevo_envio_val}")
                         if titulo_cambio: cambios.append(f"Titulo: {sheet_titulo}->{api_titulo}")
                         if sku_cambio: cambios.append(f"SKU: {sheet_sku}->{api_sku}")
                         
