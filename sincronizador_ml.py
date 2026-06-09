@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 import sys
+import time
+from gspread.exceptions import APIError
 
 # Configurar la consola para soportar caracteres UTF-8 (emojis) en Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -60,13 +62,63 @@ HORAS_ATRAS = 48
 # --- CONFIGURACIÓN DISCORD ---
 DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL')
 
+def call_with_retry(func, *args, retries=3, delay=2, backoff=2, **kwargs):
+    """Ejecuta una función que interactúa con Google Sheets con intentos de reintento en caso de error transitorio o de red."""
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            status_code = getattr(e, 'code', None)
+            try:
+                if not status_code and hasattr(e, 'response') and e.response is not None:
+                    status_code = e.response.status_code
+            except:
+                pass
+            
+            is_transient = True
+            if status_code:
+                try:
+                    status_code = int(status_code)
+                    if status_code not in [429, 500, 502, 503, 504]:
+                        is_transient = False
+                except:
+                    pass
+            
+            if not is_transient or attempt == retries - 1:
+                print(f"❌ Error definitivo de Google Sheets API tras intentos: {e}")
+                raise e
+            
+            print(f"⚠️ [Google Sheets API] Error detectado ({e}). Reintentando en {delay} segundos (intento {attempt + 1}/{retries})...")
+            time.sleep(delay)
+            delay *= backoff
+        except Exception as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise e
+            if attempt == retries - 1:
+                print(f"❌ Error definitivo de red/conexión al Sheets API tras intentos: {e}")
+                raise e
+            print(f"⚠️ [Google Sheets API] Error de conexión ({e}). Reintentando en {delay} segundos (intento {attempt + 1}/{retries})...")
+            time.sleep(delay)
+            delay *= backoff
+
+def read_config_row(config_ws):
+    """Lee las credenciales en lote para reducir llamadas de API."""
+    res = config_ws.get('A2:C2')
+    if res and len(res) > 0:
+        row = res[0]
+        while len(row) < 3:
+            row.append('')
+        return row
+    return [config_ws.acell('A2').value, config_ws.acell('B2').value, config_ws.acell('C2').value]
+
 def get_new_token(config_ws):
     """Refresca el token de acceso de Mercado Libre con depuración activa."""
     try:
         # Extraer credenciales limpiando espacios y formatos extraños
-        c_id = str(config_ws.acell('A2').value).replace(',', '').replace(' ', '').strip()
-        c_secret = str(config_ws.acell('B2').value).strip()
-        r_token = str(config_ws.acell('C2').value).strip()
+        row_vals = call_with_retry(read_config_row, config_ws)
+        c_id = str(row_vals[0] or '').replace(',', '').replace(' ', '').strip()
+        c_secret = str(row_vals[1] or '').strip()
+        r_token = str(row_vals[2] or '').strip()
         
         print(f"🔍 [DEBUG] Intentando refrescar token... Client ID detectado: {c_id}")
         
@@ -83,7 +135,7 @@ def get_new_token(config_ws):
         if res.status_code == 200:
             token_data = res.json()
             # Guardamos el nuevo refresh token devuelto por la API
-            config_ws.update_acell('C2', token_data['refresh_token'])
+            call_with_retry(config_ws.update_acell, 'C2', token_data['refresh_token'])
             print("✅ Token refrescado y guardado con éxito en la celda C2.")
             return token_data['access_token']
         else:
@@ -112,7 +164,7 @@ def obtener_sku(item_or_variation):
         
     return ''
 
-def get_data(i_id, token):
+def get_data(i_id, token, user_id=None):
     """Obtiene detalles del item, precio promocional, comisión y costo de envío."""
     headers = {'Authorization': f'Bearer {token}'}
     try:
@@ -144,22 +196,39 @@ def get_data(i_id, token):
 
         # --- CONSULTA DE COSTO DE ENVÍO ---
         shipping_cost = None
-        try:
-            ship_url = f"https://api.mercadolibre.com/items/{i_id}/shipping_options"
-            ship_res = requests.get(ship_url, headers=headers, timeout=10)
-            if ship_res.status_code == 200:
-                ship_data = ship_res.json()
-                options = ship_data.get('options', [])
-                # Intentar buscar la opción con free_shipping = True
-                for opt in options:
-                    if opt.get('free_shipping') is True:
-                        shipping_cost = float(opt.get('list_cost', 0.0))
-                        break
-                # Si no hay envío gratis, tomar el list_cost de la primera opción
-                if shipping_cost is None and options:
-                    shipping_cost = float(options[0].get('list_cost', 0.0))
-        except Exception as e:
-            print(f"⚠️ [DEBUG] No se pudo obtener el costo de envío para {i_id}: {str(e)}")
+        if user_id:
+            try:
+                # Usar el endpoint de simulación de costo de envío gratis del vendedor
+                ship_url = f"https://api.mercadolibre.com/users/{user_id}/shipping_options/free?item_id={i_id}"
+                ship_res = requests.get(ship_url, headers=headers, timeout=10)
+                if ship_res.status_code == 200:
+                    ship_data = ship_res.json()
+                    coverage = ship_data.get('coverage', {})
+                    all_country = coverage.get('all_country', {})
+                    shipping_cost = all_country.get('list_cost')
+                    if shipping_cost is not None:
+                        shipping_cost = float(shipping_cost)
+            except Exception as e:
+                print(f"⚠️ [DEBUG] No se pudo obtener el costo de envío con el nuevo endpoint para {i_id}: {str(e)}")
+
+        # Fallback al método anterior si no se obtuvo con el nuevo endpoint o si no hay user_id
+        if shipping_cost is None:
+            try:
+                ship_url = f"https://api.mercadolibre.com/items/{i_id}/shipping_options"
+                ship_res = requests.get(ship_url, headers=headers, timeout=10)
+                if ship_res.status_code == 200:
+                    ship_data = ship_res.json()
+                    options = ship_data.get('options', [])
+                    # Intentar buscar la opción con free_shipping = True
+                    for opt in options:
+                        if opt.get('free_shipping') is True:
+                            shipping_cost = float(opt.get('list_cost', 0.0))
+                            break
+                    # Si no hay envío gratis, tomar el list_cost de la primera opción
+                    if shipping_cost is None and options:
+                        shipping_cost = float(options[0].get('list_cost', 0.0))
+            except Exception as e:
+                print(f"⚠️ [DEBUG] Fallback: No se pudo obtener el costo de envío para {i_id}: {str(e)}")
 
         return {'body': it, 'promo_price': p_promo, 'comision': comision, 'shipping_cost': shipping_cost}
     except: return None
@@ -176,7 +245,7 @@ def enviar_alerta_discord(mensaje):
 
 def actualizar_historial_limpio(h_ws, nuevos_logs):
     """Filtra y actualiza la hoja de historial manteniendo el orden cronológico."""
-    datos_actuales = h_ws.get_all_values()
+    datos_actuales = call_with_retry(h_ws.get_all_values)
     encabezado = ["ID_UNICO_VARIANTE", "Cual fue el cambio", "Ultima Modificacion ML"]
     registros_validos = []
     limite_tiempo = datetime.now() - timedelta(hours=HORAS_ATRAS)
@@ -197,26 +266,38 @@ def actualizar_historial_limpio(h_ws, nuevos_logs):
     except: pass
 
     todos_limitados = todos[:5000]
-    h_ws.clear()
-    h_ws.update(values=[encabezado] + todos_limitados, range_name='A1')
+    call_with_retry(h_ws.clear)
+    call_with_retry(h_ws.update, values=[encabezado] + todos_limitados, range_name='A1')
 
 def run_update():
     # --- AUTENTICACIÓN GOOGLE ---
     sa_env = os.environ['GOOGLE_SERVICE_ACCOUNT'].strip().strip("'\"")
     sa_info = json.loads(sa_env)
     gc = gspread.service_account_from_dict(sa_info)
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = call_with_retry(gc.open_by_key, SPREADSHEET_ID)
     
     # --- REFRESH TOKEN ML ---
-    access_token = get_new_token(sh.worksheet(CONFIG_SHEET))
+    config_ws = call_with_retry(sh.worksheet, CONFIG_SHEET)
+    access_token = get_new_token(config_ws)
     if not access_token: 
         print("Error: No se pudo refrescar el token de ML. Deteniendo la ejecución.")
         return
 
+    # --- OBTENER USER ID ---
+    user_id = None
+    try:
+        me_res = requests.get("https://api.mercadolibre.com/users/me", headers={'Authorization': f'Bearer {access_token}'}, timeout=15)
+        if me_res.status_code == 200:
+            user_id = me_res.json().get('id')
+            print(f"✅ [DEBUG] User ID del vendedor obtenido: {user_id}")
+    except Exception as e:
+        print(f"⚠️ [DEBUG] No se pudo obtener el User ID del vendedor: {str(e)}")
+
     # --- OBTENER DATOS DE LA HOJA ---
     print("🔍 [DEBUG] Obteniendo registros de la pestaña 'PUBLICACIONES'...")
-    worksheet = sh.worksheet(SHEET_NAME)
-    df = pd.DataFrame(worksheet.get_all_records()).fillna('')
+    worksheet = call_with_retry(sh.worksheet, SHEET_NAME)
+    records = call_with_retry(worksheet.get_all_records)
+    df = pd.DataFrame(records).fillna('')
     
     # Omitir de la consulta los registros cuyo Estatus en la hoja sea 'Cerrada'
     df_a_consultar = df[df['Estatus'].astype(str).str.strip().str.capitalize() != 'Cerrada']
@@ -231,7 +312,7 @@ def run_update():
     print(f"🔍 [DEBUG] Descargando información de {total_ids} items desde la API de Mercado Libre...")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
-        f_to_id = {executor.submit(get_data, i_id, access_token): i_id for i_id in unique_ids}
+        f_to_id = {executor.submit(get_data, i_id, access_token, user_id): i_id for i_id in unique_ids}
         completed_count = 0
         for f in concurrent.futures.as_completed(f_to_id):
             res = f.result()
@@ -376,11 +457,13 @@ def run_update():
     if hubo_cambios:
         print("🔍 [DEBUG] Detectados cambios en los productos. Guardando actualización en Google Sheets...")
         df_cleaned = df.fillna("").astype(str).values.tolist()
-        worksheet.update(values=[df.columns.values.tolist()] + df_cleaned, range_name='A1')
+        call_with_retry(worksheet.clear)
+        call_with_retry(worksheet.update, values=[df.columns.values.tolist()] + df_cleaned, range_name='A1')
         print("✅ [DEBUG] Hoja 'PUBLICACIONES' actualizada con éxito.")
         if log_reporte:
             print(f"🔍 [DEBUG] Escribiendo {len(log_reporte)} registros en el Historial...")
-            h_ws = next((w for w in sh.worksheets() if w.title.strip() == HISTORY_SHEET), None)
+            worksheets = call_with_retry(sh.worksheets)
+            h_ws = next((w for w in worksheets if w.title.strip() == HISTORY_SHEET), None)
             if h_ws: 
                 actualizar_historial_limpio(h_ws, log_reporte)
                 print("✅ [DEBUG] Historial actualizado.")

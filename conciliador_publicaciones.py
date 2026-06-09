@@ -44,7 +44,7 @@ if 'SPREADSHEET_ID' not in os.environ:
 
 # Importar configuraciones y helpers desde el sincronizador principal
 from sincronizador_ml import (
-    get_new_token, get_data, SPREADSHEET_ID, SHEET_NAME, CONFIG_SHEET, obtener_sku
+    get_new_token, get_data, SPREADSHEET_ID, SHEET_NAME, CONFIG_SHEET, obtener_sku, call_with_retry
 )
 
 def obtener_user_id(token):
@@ -107,10 +107,11 @@ def run_conciliation():
     sa_env = os.environ['GOOGLE_SERVICE_ACCOUNT'].strip().strip("'\"")
     sa_info = json.loads(sa_env)
     gc = gspread.service_account_from_dict(sa_info)
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = call_with_retry(gc.open_by_key, SPREADSHEET_ID)
     
     # --- REFRESH TOKEN ML ---
-    access_token = get_new_token(sh.worksheet(CONFIG_SHEET))
+    config_ws = call_with_retry(sh.worksheet, CONFIG_SHEET)
+    access_token = get_new_token(config_ws)
     if not access_token:
         print("❌ Error: No se pudo refrescar el token de ML. Deteniendo conciliación.")
         return
@@ -126,8 +127,9 @@ def run_conciliation():
     print(f"✅ [DEBUG] Total de Item IDs activos/pausados en Mercado Libre: {len(api_items)}")
 
     # --- OBTENER REGISTROS DE LA HOJA ---
-    worksheet = sh.worksheet(SHEET_NAME)
-    df = pd.DataFrame(worksheet.get_all_records()).fillna('')
+    worksheet = call_with_retry(sh.worksheet, SHEET_NAME)
+    records = call_with_retry(worksheet.get_all_records)
+    df = pd.DataFrame(records).fillna('')
     original_columns = df.columns.tolist()
     
     # Filtrar solo IDs válidos que comiencen con MLM u otros prefijos de Mercado Libre
@@ -160,7 +162,7 @@ def run_conciliation():
         print(f"🔍 [DEBUG] Descargando detalles concurrentemente para {len(items_a_agregar)} nuevos items...")
         nuevos_detalles = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
-            f_to_id = {executor.submit(get_data, i_id, access_token): i_id for i_id in items_a_agregar}
+            f_to_id = {executor.submit(get_data, i_id, access_token, user_id): i_id for i_id in items_a_agregar}
             completed = 0
             for f in concurrent.futures.as_completed(f_to_id):
                 res = f.result()
@@ -284,7 +286,8 @@ def run_conciliation():
     if hubo_cambios:
         print("🔍 [DEBUG] Guardando cambios de catálogo actualizados en Google Sheets...")
         df_cleaned = df.fillna("").astype(str).values.tolist()
-        worksheet.update(values=[df.columns.values.tolist()] + df_cleaned, range_name='A1')
+        call_with_retry(worksheet.clear)
+        call_with_retry(worksheet.update, values=[df.columns.values.tolist()] + df_cleaned, range_name='A1')
         print("✅ [DEBUG] Hoja 'PUBLICACIONES' conciliada y actualizada con éxito.")
     else:
         print("🔍 [DEBUG] No se requiere realizar cambios. El catálogo en Google Sheets está perfectamente sincronizado con Mercado Libre.")

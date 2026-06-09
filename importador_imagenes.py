@@ -18,7 +18,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 # Al importar sincronizador_ml, este se encarga automáticamente de procesar
 # el argumento --env (por ejemplo: --env .env.tienda2) y cargar el archivo correspondiente.
 sys.path.append(".")
-from sincronizador_ml import get_new_token, SPREADSHEET_ID
+from sincronizador_ml import get_new_token, SPREADSHEET_ID, call_with_retry
 
 def run_image_import():
     # --- AUTENTICACIÓN GOOGLE ---
@@ -26,18 +26,19 @@ def run_image_import():
     sa_env = os.environ['GOOGLE_SERVICE_ACCOUNT'].strip().strip("'\"")
     sa_info = json.loads(sa_env)
     gc = gspread.service_account_from_dict(sa_info)
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = call_with_retry(gc.open_by_key, SPREADSHEET_ID)
     
     # --- REFRESH TOKEN ML ---
-    access_token = get_new_token(sh.worksheet('Config_ML'))
+    config_ws = call_with_retry(sh.worksheet, 'Config_ML')
+    access_token = get_new_token(config_ws)
     if not access_token:
         print("❌ Error: No se pudo refrescar el token de ML. Deteniendo la ejecución.")
         return
 
     # --- LEER HOJA CATALOGO ---
     print("🔍 Obteniendo datos de la pestaña 'CATALOGO'...")
-    ws = sh.worksheet('CATALOGO')
-    rows = ws.get_all_values()
+    ws = call_with_retry(sh.worksheet, 'CATALOGO')
+    rows = call_with_retry(ws.get_all_values)
     if len(rows) <= 1:
         print("ℹ️ Hoja vacía o solo contiene cabecera.")
         return
@@ -128,7 +129,7 @@ def run_image_import():
         batch_size = 100
         for i in range(0, len(cells_to_update), batch_size):
             batch = cells_to_update[i:i + batch_size]
-            ws.update_cells(batch, value_input_option='USER_ENTERED')
+            call_with_retry(ws.update_cells, batch, value_input_option='USER_ENTERED')
             print(f"   ✅ Lote {i // batch_size + 1} de {((len(cells_to_update) - 1) // batch_size) + 1} guardado.")
         print("🎉 Proceso finalizado exitosamente.")
     else:
