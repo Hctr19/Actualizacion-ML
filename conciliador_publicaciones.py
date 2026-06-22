@@ -213,6 +213,15 @@ def run_conciliation():
 
                         sku = obtener_sku(v)
                         if not sku:
+                            # Fallback para variaciones que no retornan SKU en el item completo
+                            try:
+                                headers_fb = {'Authorization': f'Bearer {access_token}'}
+                                v_res = requests.get(f"https://api.mercadolibre.com/items/{it_id}/variations/{v_id}", headers=headers_fb, timeout=10)
+                                if v_res.status_code == 200:
+                                    sku = obtener_sku(v_res.json())
+                            except Exception as e:
+                                print(f"⚠️ [DEBUG] Fallback SKU falló para {it_id}_{v_id}: {str(e)}")
+                        if not sku:
                             sku = obtener_sku(item)
                             
                         # Construir fila

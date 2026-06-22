@@ -410,6 +410,16 @@ def run_update():
             if v_id and v_id not in ['0', '', 'None']:
                 v_data = next((v for v in item.get('variations', []) if str(v.get('id')) == v_id), None)
                 api_sku = obtener_sku(v_data) if v_data else obtener_sku(item)
+                
+                # Fallback: si no se encontró SKU en la variación y tiene un Variant ID, consultamos su endpoint individual
+                if not api_sku:
+                    try:
+                        headers_fb = {'Authorization': f'Bearer {access_token}'}
+                        v_res = requests.get(f"https://api.mercadolibre.com/items/{it_id}/variations/{v_id}", headers=headers_fb, timeout=10)
+                        if v_res.status_code == 200:
+                            api_sku = obtener_sku(v_res.json())
+                    except Exception as e:
+                        print(f"⚠️ [DEBUG] Fallback SKU falló para {it_id}_{v_id}: {str(e)}")
             else:
                 api_sku = obtener_sku(item)
                 
